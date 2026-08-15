@@ -207,6 +207,21 @@ export async function launch({ port, kill_existing } = {}) {
     } catch { /* ignore */ }
   }
 
+  // On Windows, fall back to MSIX launch if no direct exe found
+  let isMsix = false;
+  if (!tvPath && platform === 'win32') {
+    try {
+      const appId = execSync(
+        `powershell -NoProfile -Command "(Get-StartApps | Where-Object {$_.Name -like '*TradingView*'}).AppID"`,
+        { timeout: 8000 }
+      ).toString().trim().split('\n')[0];
+      if (appId) {
+        tvPath = `__MSIX__:${appId}`;
+        isMsix = true;
+      }
+    } catch { /* ignore */ }
+  }
+
   if (!tvPath) {
     throw new Error(`TradingView not found on ${platform}. Searched: ${candidates.join(', ')}. Launch manually with: /path/to/TradingView --remote-debugging-port=${cdpPort}`);
   }
@@ -219,8 +234,19 @@ export async function launch({ port, kill_existing } = {}) {
     } catch { /* may not be running */ }
   }
 
-  const child = spawn(tvPath, [`--remote-debugging-port=${cdpPort}`], { detached: true, stdio: 'ignore' });
-  child.unref();
+  if (isMsix) {
+    // MSIX apps can't receive CLI flags directly; write CDP port to registry so
+    // Electron picks it up, then launch via shell:AppsFolder alias.
+    const appId = tvPath.replace('__MSIX__:', '');
+    const regKey = 'HKCU\\Software\\TradingView\\TradingView';
+    try {
+      execSync(`reg add "${regKey}" /v remote-debugging-port /t REG_SZ /d "${cdpPort}" /f`, { timeout: 5000 });
+    } catch { /* ignore if reg fails */ }
+    execSync(`powershell -NoProfile -Command "Start-Process 'shell:AppsFolder\\${appId}'"`, { timeout: 5000 });
+  } else {
+    const child = spawn(tvPath, [`--remote-debugging-port=${cdpPort}`], { detached: true, stdio: 'ignore' });
+    child.unref();
+  }
 
   for (let i = 0; i < 15; i++) {
     await new Promise(r => setTimeout(r, 1000));
