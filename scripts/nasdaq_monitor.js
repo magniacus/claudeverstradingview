@@ -56,18 +56,21 @@ function yahooGet(url) {
 function stooqGet(url) {
   return new Promise((resolve, reject) => {
     const opts = { headers: { 'User-Agent': 'Mozilla/5.0' } };
-    https.get(url, opts, (res) => {
+    const req = https.get(url, opts, (res) => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => resolve(data.trim()));
     }).on('error', reject);
+    // Stooq peut ne jamais répondre → abandon après 10s pour basculer sur Yahoo
+    req.setTimeout(10000, () => req.destroy(new Error('Stooq timeout')));
   });
 }
 
 async function getPrice() {
   // Stooq : @nq.f = E-mini NQ Futures (@ requis pour les futures CME sur Stooq)
   // colonnes avec sd2t2ohlcv : Symbol, Date, Time, Open, High, Low, Close, Volume
-  const csv = await stooqGet('https://stooq.com/q/l/?s=%40nq.f&f=sd2t2ohlcv&h&e=csv');
+  // Erreur réseau Stooq (timeout, etc.) → csv vide → fallback Yahoo
+  const csv = await stooqGet('https://stooq.com/q/l/?s=%40nq.f&f=sd2t2ohlcv&h&e=csv').catch(() => '');
   const lines = csv.split('\n').filter(l => l.trim());
   if (lines.length < 2 || lines[1].includes('N/D')) {
     // Fallback Yahoo Finance si Stooq indisponible
