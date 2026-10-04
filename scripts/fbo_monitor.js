@@ -22,42 +22,19 @@ if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
 const CDP_PORT = 9222;
 const CHECK_INTERVAL_MS = 60 * 1000; // toutes les minutes
 
-// Zones FBO identifiées (4H - BTCUSD)
-const FBO_ZONES = [
-  {
-    name: '🔴 FBO Baissier — Résistance OB',
-    high: 64579,
-    low: 64361,
-    bias: 'SHORT',
-    entry: '64 400 – 64 580',
-    stop: '65 000',
-    tp1: '63 380',
-    tp2: '63 000',
-    rr: '2.5:1',
-  },
-  {
-    name: '🟢 FBO Haussier — Support OB',
-    high: 63400,
-    low: 63177,
-    bias: 'LONG',
-    entry: '63 200 – 63 400',
-    stop: '62 900',
-    tp1: '64 066',
-    tp2: '64 579',
-    rr: '2:1',
-  },
-  {
-    name: '🟢 FBO Haussier Profond — Liquidity Sweep',
-    high: 62200,
-    low: 61900,
-    bias: 'LONG',
-    entry: '61 900 – 62 200',
-    stop: '61 139',
-    tp1: '63 380',
-    tp2: '64 361',
-    rr: '3:1',
-  },
-];
+// Zones FBO (4H - BTCUSDT Binance) recalculées automatiquement au démarrage puis chaque jour à RECALC_UTC
+let FBO_ZONES = [];
+let zonesDay = null;                // jour UTC (YYYY-MM-DD) du dernier calcul réussi
+const RECALC_UTC = { h: 0, m: 5 };  // 00:05 UTC, juste après la clôture de la bougie 4H de 00:00
+const SEND_DAILY_SUMMARY = true;    // envoie les nouvelles zones sur Telegram après chaque recalcul
+const DRY_RUN = process.argv.includes('--zones');
+
+// Paramètres de détection
+const KLINES_LIMIT    = 500;  // bougies 4H récupérées (~83 jours)
+const OB_LOOKBACK     = 180;  // bougies 4H scannées pour les OB et swings (~30 jours)
+const DISPLACEMENT    = 2;    // impulsion minimale (en ATR) sur les 3 bougies suivant l'OB
+const SWING_SIDE      = 3;    // fractale : 3 bougies de chaque côté
+const ATR_LEN         = 14;
 
 // Cooldown global : une seule alerte toutes les 4H, toutes zones confondues
 const ALERT_COOLDOWN_MS = 4 * 60 * 60 * 1000;
@@ -98,6 +75,129 @@ async function getPrice() {
   return parseFloat(data.price);
 }
 
+// ── Calcul automatique des zones FBO ─────────────────────────────────────────
+
+const fmt = n => Math.round(n).toLocaleString('fr-FR');
+
+async function getKlines4h() {
+  const rows = await fetchJson(`https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=4h&limit=${KLINES_LIMIT}`);
+  if (!Array.isArray(rows)) throw new Error('Klines Binance invalides');
+  // La dernière bougie est en cours : on la retire pour ne travailler que sur des bougies clôturées
+  return rows.slice(0, -1).map(r => ({ t: r[0], o: +r[1], h: +r[2], l: +r[3], c: +r[4] }));
+}
+
+function computeZones(k, price) {
+  const N = k.length;
+  const tr = k.map((b, i) => i ? Math.max(b.h - b.l, Math.abs(b.h - k[i - 1].c), Math.abs(b.l - k[i - 1].c)) : b.h - b.l);
+  const atrAt = i => { const s = tr.slice(Math.max(0, i - ATR_LEN + 1), i + 1); return s.reduce((a, b) => a + b) / s.length; };
+  const atr = atrAt(N - 1);
+  const start = Math.max(SWING_SIDE, N - OB_LOOKBACK);
+
+  // Swings fractals confirmés
+  const highs = [], lows = [];
+  for (let i = start; i < N - SWING_SIDE; i++) {
+    const w = k.slice(i - SWING_SIDE, i + SWING_SIDE + 1);
+    if (k[i].h === Math.max(...w.map(b => b.h))) highs.push(k[i].h);
+    if (k[i].l === Math.min(...w.map(b => b.l))) lows.push(k[i].l);
+  }
+
+  // Order blocks : dernière bougie opposée avant une impulsion >= DISPLACEMENT ATR sur 3 bougies,
+  // non invalidés (aucune clôture au-delà de leur bord opposé depuis)
+  const bulls = [], bears = [];
+  for (let i = start; i < N - 3; i++) {
+    const a = atrAt(i), next = k.slice(i + 1, i + 4), after = k.slice(i + 4);
+    const up = Math.max(...next.map(b => b.h)) - k[i].h;
+    const dn = k[i].l - Math.min(...next.map(b => b.l));
+    if (k[i].c < k[i].o && up >= DISPLACEMENT * a) {
+      const z = { low: k[i].l, high: Math.max(k[i].o, k[i].c) };
+      if (!after.some(b => b.c < z.low)) bulls.push(z);
+    }
+    if (k[i].c > k[i].o && dn >= DISPLACEMENT * a) {
+      const z = { low: Math.min(k[i].o, k[i].c), high: k[i].h };
+      if (!after.some(b => b.c > z.high)) bears.push(z);
+    }
+  }
+
+  // Cibles : premier swing à >= 1,5 ATR du bord de la zone, puis le suivant à >= 1 ATR plus loin
+  const targetsDown = from => {
+    const s = [...new Set(lows)].filter(p => p <= from - 1.5 * atr).sort((a, b) => b - a);
+    const tp1 = s[0] ?? from - 2 * atr;
+    return [tp1, s.find(p => p <= tp1 - atr) ?? tp1 - 1.5 * atr];
+  };
+  const targetsUp = from => {
+    const s = [...new Set(highs)].filter(p => p >= from + 1.5 * atr).sort((a, b) => a - b);
+    const tp1 = s[0] ?? from + 2 * atr;
+    return [tp1, s.find(p => p >= tp1 + atr) ?? tp1 + 1.5 * atr];
+  };
+  const rr = (low, high, stop, tp2) => {
+    const mid = (low + high) / 2;
+    return (Math.abs(tp2 - mid) / Math.abs(mid - stop)).toFixed(1) + ':1';
+  };
+  const zone = (name, bias, low, high, stop, tp1, tp2) => ({
+    name, bias, low: Math.round(low), high: Math.round(high),
+    entry: `${fmt(low)} – ${fmt(high)}`, stop: fmt(stop), tp1: fmt(tp1), tp2: fmt(tp2),
+    rr: rr(low, high, stop, tp2),
+  });
+
+  const zones = [];
+  const bear = bears.filter(z => z.high >= price).sort((a, b) => a.low - b.low)[0];
+  const bull = bulls.filter(z => z.low <= price).sort((a, b) => b.high - a.high)[0];
+
+  if (bear) {
+    // Stop au-dessus des sommets proches (liquidité), sinon 1,5 ATR au-dessus de la zone
+    const near = highs.filter(p => p > bear.high && p <= bear.high + 2 * atr);
+    const stop = (near.length ? Math.max(...near) : bear.high + 1.4 * atr) + 0.1 * atr;
+    const [tp1, tp2] = targetsDown(bear.low);
+    zones.push(zone('🔴 FBO Baissier — Résistance OB', 'SHORT', bear.low, bear.high, stop, tp1, tp2));
+  }
+  if (bull) {
+    const near = lows.filter(p => p < bull.low && p >= bull.low - 2 * atr);
+    const stop = (near.length ? Math.min(...near) : bull.low - 1.4 * atr) - 0.1 * atr;
+    const [tp1, tp2] = targetsUp(bull.high);
+    zones.push(zone('🟢 FBO Haussier — Support OB', 'LONG', bull.low, bull.high, stop, tp1, tp2));
+  }
+
+  // Liquidity sweep : sous le groupe de creux le plus proche en dessous du support (ou du prix)
+  const ref = bull ? bull.low : price;
+  const below = [...new Set(lows)].filter(p => p < ref - 0.5 * atr).sort((a, b) => b - a);
+  if (below.length) {
+    const cluster = below.filter(p => p >= below[0] - 0.75 * atr);
+    const level = Math.min(...cluster);
+    const low = level - atr, high = level - 0.1 * atr;
+    const stop = low - atr;
+    const tp1 = bull ? bull.high : targetsUp(high)[0];
+    const tp2 = targetsUp(tp1 - 1.5 * atr)[1];
+    zones.push(zone('🟢 FBO Haussier Profond — Liquidity Sweep', 'LONG', low, high, stop, tp1, tp2));
+  }
+
+  return { zones, atr };
+}
+
+async function recalcZones() {
+  const [klines, price] = await Promise.all([getKlines4h(), getPrice()]);
+  const { zones, atr } = computeZones(klines, price);
+  if (!zones.length) throw new Error('aucune zone détectée');
+  FBO_ZONES = zones;
+  zonesDay = new Date().toISOString().slice(0, 10);
+  zoneConfirm.clear();
+
+  console.log(`[${new Date().toISOString()}] Zones recalculées (prix ${fmt(price)}, ATR14 ${fmt(atr)}) :`);
+  FBO_ZONES.forEach(z => console.log(`  • ${z.name}: ${z.low} – ${z.high} | stop ${z.stop} | TP ${z.tp1} / ${z.tp2} | R/R ${z.rr}`));
+
+  if (SEND_DAILY_SUMMARY && !DRY_RUN) {
+    const lines = FBO_ZONES.map(z => `${z.name}\n   ${z.entry} · stop ${z.stop} · TP ${z.tp1} / ${z.tp2} · R/R ${z.rr}`);
+    await sendTelegram(`📐 <b>Zones FBO du jour — BTCUSD 4H</b>\n\n💰 Prix : ${fmt(price)} $ · ATR14 : ${fmt(atr)}\n\n${lines.join('\n\n')}`);
+  }
+}
+
+// Recalcul si on a passé l'heure de recalcul du jour et que les zones datent d'un jour précédent
+function recalcDue() {
+  const now = new Date();
+  const today = now.toISOString().slice(0, 10);
+  const pastTime = now.getUTCHours() * 60 + now.getUTCMinutes() >= RECALC_UTC.h * 60 + RECALC_UTC.m;
+  return zonesDay === null || (zonesDay !== today && pastTime);
+}
+
 function sendTelegram(message) {
   return new Promise((resolve, reject) => {
     const text = encodeURIComponent(message);
@@ -130,6 +230,12 @@ ${zone.name}
 }
 
 async function check() {
+  if (recalcDue()) {
+    try { await recalcZones(); }
+    catch (err) { console.error(`[${new Date().toISOString()}] Recalcul des zones échoué (${err.message}) — zones précédentes conservées`); }
+  }
+  if (!FBO_ZONES.length) return;
+
   try {
     const price = await getPrice();
     if (!price) { console.log(`[${new Date().toISOString()}] Prix non disponible`); return; }
@@ -171,12 +277,16 @@ async function check() {
   }
 }
 
-console.log('🚀 FBO Monitor démarré');
-console.log('Zones surveillées:');
-FBO_ZONES.forEach(z => console.log(`  • ${z.name}: ${z.low} – ${z.high}`));
-console.log(`Vérification toutes les ${CHECK_INTERVAL_MS / 1000}s\n`);
+if (DRY_RUN) {
+  // node scripts/fbo_monitor.js --zones : affiche les zones calculées puis quitte (aucun envoi Telegram)
+  recalcZones().catch(err => { console.error(`Erreur: ${err.message}`); process.exit(1); });
+} else {
+  console.log('🚀 FBO Monitor démarré');
+  console.log(`Recalcul des zones : au démarrage puis chaque jour à ${String(RECALC_UTC.h).padStart(2, '0')}:${String(RECALC_UTC.m).padStart(2, '0')} UTC`);
+  console.log(`Vérification toutes les ${CHECK_INTERVAL_MS / 1000}s\n`);
 
-// Premier check immédiat
-check();
-// Puis toutes les minutes
-setInterval(check, CHECK_INTERVAL_MS);
+  // Premier check immédiat (calcule les zones)
+  check();
+  // Puis toutes les minutes
+  setInterval(check, CHECK_INTERVAL_MS);
+}
