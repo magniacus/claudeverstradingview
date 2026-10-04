@@ -22,10 +22,10 @@ if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
 const CDP_PORT = 9222;
 const CHECK_INTERVAL_MS = 60 * 1000; // toutes les minutes
 
-// Zones FBO (4H - BTCUSDT Binance) recalculées automatiquement au démarrage puis chaque jour à RECALC_UTC
-let FBO_ZONES = [];
-let zonesDay = null;                // jour UTC (YYYY-MM-DD) du dernier calcul réussi
-const RECALC_UTC = { h: 0, m: 5 };  // 00:05 UTC, juste après la clôture de la bougie 4H de 00:00
+// Zones FBO (4H - BTCUSDT Binance) recalculées une fois par jour à RECALC_LOCAL (heure locale du PC).
+// Elles sont sauvegardées dans STATE_FILE : un redémarrage reprend les zones du jour sans recalculer.
+// Si le monitor ne tournait pas à l'heure prévue, le calcul du jour est fait dès son démarrage.
+const RECALC_LOCAL = { h: 8, m: 0 };
 const SEND_DAILY_SUMMARY = true;    // envoie les nouvelles zones sur Telegram après chaque recalcul
 const DRY_RUN = process.argv.includes('--zones');
 
@@ -48,7 +48,9 @@ function saveState(state) {
 }
 
 let state = loadState();
-// Raccourci : state.lastAlertTime est le timestamp persisté
+// Persistés : state.lastAlertTime, state.zones, state.zonesDay (jour local YYYY-MM-DD du dernier calcul)
+let FBO_ZONES = Array.isArray(state.zones) ? state.zones : [];
+let zonesDay = FBO_ZONES.length ? state.zonesDay ?? null : null;
 
 // Confirmation : nombre de checks consécutifs où le prix est dans la zone
 // L'alerte n'est envoyée qu'après CONFIRM_COUNT checks (= 2 minutes)
@@ -178,8 +180,9 @@ async function recalcZones() {
   const { zones, atr } = computeZones(klines, price);
   if (!zones.length) throw new Error('aucune zone détectée');
   FBO_ZONES = zones;
-  zonesDay = new Date().toISOString().slice(0, 10);
+  zonesDay = localDay();
   zoneConfirm.clear();
+  if (!DRY_RUN) saveState(Object.assign(state, { zones: FBO_ZONES, zonesDay }));
 
   console.log(`[${new Date().toISOString()}] Zones recalculées (prix ${fmt(price)}, ATR14 ${fmt(atr)}) :`);
   FBO_ZONES.forEach(z => console.log(`  • ${z.name}: ${z.low} – ${z.high} | stop ${z.stop} | TP ${z.tp1} / ${z.tp2} | R/R ${z.rr}`));
@@ -190,12 +193,16 @@ async function recalcZones() {
   }
 }
 
-// Recalcul si on a passé l'heure de recalcul du jour et que les zones datent d'un jour précédent
+// Jour local au format YYYY-MM-DD
+function localDay(d = new Date()) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// Recalcul si aucune zone n'est connue, ou si l'heure du jour est passée et que les zones datent d'un jour précédent
 function recalcDue() {
   const now = new Date();
-  const today = now.toISOString().slice(0, 10);
-  const pastTime = now.getUTCHours() * 60 + now.getUTCMinutes() >= RECALC_UTC.h * 60 + RECALC_UTC.m;
-  return zonesDay === null || (zonesDay !== today && pastTime);
+  const pastTime = now.getHours() * 60 + now.getMinutes() >= RECALC_LOCAL.h * 60 + RECALC_LOCAL.m;
+  return zonesDay === null || (zonesDay !== localDay(now) && pastTime);
 }
 
 function sendTelegram(message) {
@@ -278,14 +285,20 @@ async function check() {
 }
 
 if (DRY_RUN) {
-  // node scripts/fbo_monitor.js --zones : affiche les zones calculées puis quitte (aucun envoi Telegram)
+  // node scripts/fbo_monitor.js --zones : affiche les zones calculées puis quitte
+  // (aucun envoi Telegram, zones sauvegardées inchangées)
   recalcZones().catch(err => { console.error(`Erreur: ${err.message}`); process.exit(1); });
 } else {
+  const hhmm = `${String(RECALC_LOCAL.h).padStart(2, '0')}:${String(RECALC_LOCAL.m).padStart(2, '0')}`;
   console.log('🚀 FBO Monitor démarré');
-  console.log(`Recalcul des zones : au démarrage puis chaque jour à ${String(RECALC_UTC.h).padStart(2, '0')}:${String(RECALC_UTC.m).padStart(2, '0')} UTC`);
+  console.log(`Recalcul des zones : une fois par jour à ${hhmm} (heure locale)`);
+  if (FBO_ZONES.length) {
+    console.log(`Zones sauvegardées du ${zonesDay} :`);
+    FBO_ZONES.forEach(z => console.log(`  • ${z.name}: ${z.low} – ${z.high} | stop ${z.stop} | TP ${z.tp1} / ${z.tp2} | R/R ${z.rr}`));
+  }
   console.log(`Vérification toutes les ${CHECK_INTERVAL_MS / 1000}s\n`);
 
-  // Premier check immédiat (calcule les zones)
+  // Premier check immédiat (calcule les zones seulement si aucune n'est sauvegardée ou si celles du jour manquent après l'heure prévue)
   check();
   // Puis toutes les minutes
   setInterval(check, CHECK_INTERVAL_MS);
