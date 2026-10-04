@@ -8,28 +8,47 @@ import { evaluate, evaluateAsync, getClient } from '../connection.js';
 // ── Monaco finder (injected into TV page) ──
 const FIND_MONACO = `
   (function findMonacoEditor() {
-    var container = document.querySelector('.monaco-editor.pine-editor-monaco');
-    if (!container) return null;
-    var el = container;
-    var fiberKey;
-    for (var i = 0; i < 20; i++) {
-      if (!el) break;
-      fiberKey = Object.keys(el).find(function(k) { return k.startsWith('__reactFiber$'); });
-      if (fiberKey) break;
-      el = el.parentElement;
-    }
-    if (!fiberKey) return null;
-    var current = el[fiberKey];
-    for (var d = 0; d < 15; d++) {
-      if (!current) break;
-      if (current.memoizedProps && current.memoizedProps.value && current.memoizedProps.value.monacoEnv) {
-        var env = current.memoizedProps.value.monacoEnv;
-        if (env.editor && typeof env.editor.getEditors === 'function') {
-          var editors = env.editor.getEditors();
-          if (editors.length > 0) return { editor: editors[0], env: env };
-        }
+    // TradingView renders two .monaco-editor.pine-editor-monaco nodes: a hidden shell
+    // (no textarea, no React fiber) and the real visible editor. Try visible ones first.
+    var containers = Array.prototype.slice.call(document.querySelectorAll('.monaco-editor.pine-editor-monaco'));
+    containers.sort(function(a, b) { return (b.offsetWidth > 0 ? 1 : 0) - (a.offsetWidth > 0 ? 1 : 0); });
+    for (var c = 0; c < containers.length; c++) {
+      var el = containers[c];
+      var fiberKey = null;
+      for (var i = 0; i < 20; i++) {
+        if (!el) break;
+        fiberKey = Object.keys(el).find(function(k) { return k.startsWith('__reactFiber$'); });
+        if (fiberKey) break;
+        el = el.parentElement;
       }
-      current = current.return;
+      if (!fiberKey) continue;
+      var current = el[fiberKey];
+      for (var d = 0; d < 40; d++) {
+        if (!current) break;
+        if (current.memoizedProps && current.memoizedProps.value && current.memoizedProps.value.monacoEnv) {
+          var env = current.memoizedProps.value.monacoEnv;
+          if (env.editor && typeof env.editor.getEditors === 'function') {
+            var editors = env.editor.getEditors();
+            if (editors.length > 0) {
+              // getEditors() can return several instances (hidden templates included);
+              // prefer the one attached to a visible DOM node, then the last non-empty one.
+              var target = null;
+              for (var e = 0; e < editors.length; e++) {
+                var n = editors[e].getDomNode && editors[e].getDomNode();
+                if (n && n.offsetWidth > 0) { target = editors[e]; break; }
+              }
+              if (!target) {
+                for (var e2 = 0; e2 < editors.length; e2++) {
+                  if (editors[e2].getValue && editors[e2].getValue().length > 0) target = editors[e2];
+                }
+              }
+              if (!target) target = editors[0];
+              return { editor: target, env: env };
+            }
+          }
+        }
+        current = current.return;
+      }
     }
     return null;
   })()

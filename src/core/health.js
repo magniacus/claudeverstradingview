@@ -234,18 +234,34 @@ export async function launch({ port, kill_existing } = {}) {
     } catch { /* may not be running */ }
   }
 
+  let childPid = null;
   if (isMsix) {
-    // MSIX apps can't receive CLI flags directly; write CDP port to registry so
-    // Electron picks it up, then launch via shell:AppsFolder alias.
-    const appId = tvPath.replace('__MSIX__:', '');
-    const regKey = 'HKCU\\Software\\TradingView\\TradingView';
+    // MSIX: the registry/shell:AppsFolder route never enables remote debugging.
+    // The WindowsApps exe is directly executable — spawn it with the CDP flag.
+    let exePath = null;
     try {
-      execSync(`reg add "${regKey}" /v remote-debugging-port /t REG_SZ /d "${cdpPort}" /f`, { timeout: 5000 });
-    } catch { /* ignore if reg fails */ }
-    execSync(`powershell -NoProfile -Command "Start-Process 'shell:AppsFolder\\${appId}'"`, { timeout: 5000 });
+      exePath = execSync(
+        `powershell -NoProfile -Command "$p = Get-AppxPackage -Name '*TradingView*' | Select-Object -First 1; if ($p) { Join-Path $p.InstallLocation 'TradingView.exe' }"`,
+        { timeout: 10000 }
+      ).toString().trim();
+    } catch { /* ignore */ }
+    if (exePath && existsSync(exePath)) {
+      const child = spawn(exePath, [`--remote-debugging-port=${cdpPort}`], { detached: true, stdio: 'ignore' });
+      child.unref();
+      childPid = child.pid;
+    } else {
+      // Fallback: registry hint + shell alias launch (CDP may not come up).
+      const appId = tvPath.replace('__MSIX__:', '');
+      const regKey = 'HKCU\\Software\\TradingView\\TradingView';
+      try {
+        execSync(`reg add "${regKey}" /v remote-debugging-port /t REG_SZ /d "${cdpPort}" /f`, { timeout: 5000 });
+      } catch { /* ignore if reg fails */ }
+      execSync(`powershell -NoProfile -Command "Start-Process 'shell:AppsFolder\\${appId}'"`, { timeout: 5000 });
+    }
   } else {
     const child = spawn(tvPath, [`--remote-debugging-port=${cdpPort}`], { detached: true, stdio: 'ignore' });
     child.unref();
+    childPid = child.pid;
   }
 
   for (let i = 0; i < 15; i++) {
@@ -262,7 +278,7 @@ export async function launch({ port, kill_existing } = {}) {
       if (ready) {
         const info = JSON.parse(ready);
         return {
-          success: true, platform, binary: tvPath, pid: child.pid,
+          success: true, platform, binary: tvPath, pid: childPid,
           cdp_port: cdpPort, cdp_url: `http://localhost:${cdpPort}`,
           browser: info.Browser, user_agent: info['User-Agent'],
         };
@@ -271,7 +287,7 @@ export async function launch({ port, kill_existing } = {}) {
   }
 
   return {
-    success: true, platform, binary: tvPath, pid: child.pid, cdp_port: cdpPort, cdp_ready: false,
+    success: true, platform, binary: tvPath, pid: childPid, cdp_port: cdpPort, cdp_ready: false,
     warning: 'TradingView launched but CDP not responding yet. It may still be loading. Try tv_health_check in a few seconds.',
   };
 }
