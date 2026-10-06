@@ -257,19 +257,19 @@ async function check() {
         const count = (zoneConfirm.get(zoneKey) || 0) + 1;
         zoneConfirm.set(zoneKey, count);
 
-        const cooldownOk = Date.now() - state.lastAlertTime >= ALERT_COOLDOWN_MS;
+        const cooldownOk = state.lastAlertDay !== localDay();
 
         if (count === CONFIRM_COUNT && cooldownOk) {
           console.log(`→ ZONE FBO CONFIRMÉE (${count} checks): ${zone.name}`);
           state.lastAlertTime = Date.now();
+          state.lastAlertDay = localDay();
           saveState(state);
           await sendTelegram(buildAlert(zone, price));
           console.log('→ Alerte Telegram envoyée !');
         } else if (count < CONFIRM_COUNT) {
           console.log(`→ Zone ${zone.name} — confirmation ${count}/${CONFIRM_COUNT}`);
         } else if (!cooldownOk) {
-          const remainMin = Math.round((ALERT_COOLDOWN_MS - (Date.now() - state.lastAlertTime)) / 60000);
-          console.log(`→ Zone ${zone.name} — cooldown global actif (encore ${remainMin} min)`);
+          console.log(`→ Zone ${zone.name} — alerte déjà envoyée aujourd'hui`);
         }
       } else {
         // Prix sorti : reset le compteur de confirmation

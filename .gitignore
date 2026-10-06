@@ -5,3 +5,4 @@ temp_*
 *.log
 discovery-log.json
 scripts/fbo_monitor_state.json
+nasdaq_alert_day.json

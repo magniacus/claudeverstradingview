@@ -11,6 +11,19 @@
  */
 
 import https from 'https';
+import fs from 'fs';
+
+// Verrou "une alerte par jour" persisté (survit aux redémarrages)
+const ALERT_DAY_FILE = new URL('../nasdaq_alert_day.json', import.meta.url);
+function localDay(d = new Date()) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function readAlertDay() {
+  try { return JSON.parse(fs.readFileSync(ALERT_DAY_FILE, 'utf8')).day; } catch { return null; }
+}
+function writeAlertDay(day) {
+  try { fs.writeFileSync(ALERT_DAY_FILE, JSON.stringify({ day })); } catch {}
+}
 
 const TELEGRAM_TOKEN   = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -246,6 +259,7 @@ async function check() {
     const nearbyLevels = getNearbyLevels(price);
 
     for (const level of nearbyLevels) {
+      if (readAlertDay() === localDay()) break; // une seule alerte par jour
       if (!isRetracement(level, price, lastDirection)) continue;
 
       const levelKey = `${level.level}_${lastDirection}`;
@@ -258,6 +272,7 @@ async function check() {
       console.log(`  → Niveau ${level.level} (x${level.type}) — ${stars}⭐ | pivot:${nearPivot}`);
 
       alertedLevels.set(levelKey, Date.now());
+      writeAlertDay(localDay());
       await sendTelegram(buildAlert(price, level, stars, nearPivot, lastDirection, pivots));
       console.log(`  → Alerte Telegram envoyée (${stars}⭐)`);
     }
